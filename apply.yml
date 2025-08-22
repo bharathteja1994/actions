@@ -97,8 +97,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.TAG }}
-          repository: rio-tinto/${{ inputs.GH_REPO }}
+          ref: ${{ inputs.tag }}
+          repository: rio-tinto/${{ inputs.gh_repo }}
 
       - name: Configure GitHub credentials
         run: |
@@ -125,36 +125,88 @@ jobs:
           cd ${{ inputs.tf_dir }}
           terraform init
 
-      - name: Create Workspace
+      - name: Validate Terraform Configuration
         run: |
           cd ${{ inputs.tf_dir }}
-          terraform workspace new ${{ inputs.tf_workspace }}
+          terraform validate
+
+      - name: Create or Select Workspace
+        run: |
+          cd ${{ inputs.tf_dir }}
+          WORKSPACE="${{ inputs.tf_workspace }}"
+          
+          # Check if workspace exists
+          if terraform workspace list | grep -q "$WORKSPACE"; then
+            echo "Workspace $WORKSPACE already exists, selecting it"
+            terraform workspace select $WORKSPACE
+          else
+            echo "Creating new workspace $WORKSPACE"
+            terraform workspace new $WORKSPACE
+          fi
+
+      - name: Terraform Plan (Validation)
+        id: tfPlan
+        run: |
+          cd ${{ inputs.tf_dir }}
+          terraform plan -var-file=${{ inputs.tf_file }} -detailed-exitcode
         continue-on-error: true
 
-      - name: Select Workspace
+      - name: Check Plan Exit Code
         run: |
-          cd ${{ inputs.tf_dir }}
-          terraform workspace select ${{ inputs.tf_workspace }}
+          if [ "${{ steps.tfPlan.outcome }}" == "failure" ]; then
+            echo "Terraform plan failed. Please review the plan output above."
+            exit 1
+          fi
+          echo "Terraform plan completed successfully"
 
       - name: Terraform Apply
+        id: tfApply
         if: ${{ inputs.databricks_account_id != '782ba817-b9bf-4033-9aa9-56bb80139fba' }}
         run: |
           cd ${{ inputs.tf_dir }}
-          terraform apply -var-file=${{ inputs.tf_file }} -auto-approve
+          
+          # Run apply with better error handling
+          if terraform apply -var-file=${{ inputs.tf_file }} -auto-approve; then
+            echo "Apply completed successfully"
+            
+            # Capture outputs if available
+            if terraform output -json | grep -q "databricks_workspace_url"; then
+              echo "databricks_workspace_url=$(terraform output -raw databricks_workspace_url)" >> $GITHUB_OUTPUT
+            fi
+            
+            # Show the final state
+            terraform show -no-color
+          else
+            echo "Terraform apply failed"
+            exit 1
+          fi
 
-      - name: Generate GitHub Comment for Terraform Apply
+      - name: Generate Enhanced GitHub Comment
         if: ${{ inputs.databricks_account_id != '782ba817-b9bf-4033-9aa9-56bb80139fba' && github.event_name == 'pull_request' }}
         run: |
           cd ${{ inputs.tf_dir }}
+          
+          # Get apply summary
           APPLY_OUTPUT=$(terraform show -no-color)
           
-          COMMENT="## Terraform apply completed in ${{ inputs.tf_dir }}
+          # Get resource count
+          RESOURCE_COUNT=$(terraform state list | wc -l)
           
-          **Apply completed successfully!**
+          COMMENT="## ✅ Terraform Apply Completed Successfully
           
-          $APPLY_OUTPUT"
+          **Directory:** \`${{ inputs.tf_dir }}\`
+          **Workspace:** \`${{ inputs.tf_workspace }}\`
+          **Resources:** $RESOURCE_COUNT
           
-          gh pr comment ${{ github.event.pull_request.number }} --body "$COMMENT"
+          ### Apply Summary
+          \`\`\`
+          $APPLY_OUTPUT
+          \`\`\`
+          
+          ---
+          *Applied at: $(date -u)*"
+          
+          gh pr comment ${{ github.event.repository.number }} --body "$COMMENT"
 
       - name: Terraform Apply Databricks Workspace
         id: tfApply
